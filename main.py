@@ -6,6 +6,7 @@
 import os
 import streamlit as st
 import nest_asyncio
+import requests   # <-- ADDED
 
 # -------------------------------------------------
 # STREAMLIT PAGE CONFIG (MUST BE FIRST)
@@ -39,17 +40,14 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 # -------------------------------------------------
 OPENAI_API_KEY = None
 
-# 1. Try Streamlit Secrets (Cloud)
 try:
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 except Exception:
     pass
 
-# 2. Fallback to environment variable (local dev)
 if not OPENAI_API_KEY:
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
-# 3. Stop if missing
 if not OPENAI_API_KEY:
     st.error(
         "❌ OpenAI API key not found.\n\n"
@@ -65,6 +63,47 @@ PERSIST_DIR = "storage"
 
 os.makedirs(PDF_FOLDER, exist_ok=True)
 os.makedirs(PERSIST_DIR, exist_ok=True)
+
+# -------------------------------------------------
+# GOOGLE DRIVE PDF SOURCES (ADDED)
+# -------------------------------------------------
+PDF_FILES = {
+    "Consolidated-HIV-and-AIDS-Guidelines-2022.pdf": "1rY_UE-sIw4f5Z5VUt0pyllPs7tSENsSr",
+    "PrEP.pdf": "1n0Mtds2dSb6lCaJm6Ic8-NtaEIHnH5UQ",
+    "NTLP_manual.pdf": "1SEPZ9j5zew9XcIeCdrXwzcopCulf_APZ",
+    "UCG.pdf": "1f68UdsRdYwXW5DNN61pBNQXK7TkpMc0o",
+    "PMDT.pdf": "1zhFrJC90olY7aaledw_RyKR_sC58XV2j",
+    "HTS.pdf": "1mI8r0B2GmRGoWrJAEAOBZcpXb5znPmWs",
+    "IPC.pdf": "1DKmCrueBly6jFtUP9Ox631jqzGDsR2tV",
+    "TB_children.pdf": "1HUtgNMO_D-CK6ofLPf6egteHG7lhsd5S",
+    "prevention.pdf": "1yTZ6JiB4ky8CcGK9tabkH3kLWCT2js4J",
+    "TB_Lep.pdf": "1UUKe1PPgti_Gm6RgDq-kBexv2BgYXxTF",
+    "CKD.pdf": "1sOVGB7R1IEu3kWQrdd0IZCNmxXHJ3jWC",
+    "DSD.pdf": "1WRerkPmfRAzgPS234yP56aJ8zYXPwcjT",
+}
+
+# -------------------------------------------------
+# DOWNLOAD PDFs FROM GOOGLE DRIVE (ADDED)
+# -------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def ensure_pdfs_present():
+    for filename, file_id in PDF_FILES.items():
+        local_path = os.path.join(PDF_FOLDER, filename)
+
+        if os.path.exists(local_path):
+            continue  # already downloaded
+
+        url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+
+            with open(local_path, "wb") as f:
+                f.write(r.content)
+
+        except Exception as e:
+            st.warning(f"Failed to download {filename}: {e}")
 
 # -------------------------------------------------
 # PROMPT
@@ -109,7 +148,6 @@ def extract_text_and_tables(pdf_path: str) -> list[LIDocument]:
     docs = []
     fname = os.path.basename(pdf_path)
 
-    # ---- TEXT
     try:
         reader = PdfReader(pdf_path)
         for i, page in enumerate(reader.pages):
@@ -118,25 +156,20 @@ def extract_text_and_tables(pdf_path: str) -> list[LIDocument]:
                 docs.append(
                     LIDocument(
                         text=text,
-                        metadata={
-                            "source_file": fname,
-                            "page": i + 1,
-                        },
+                        metadata={"source_file": fname, "page": i + 1},
                     )
                 )
     except Exception:
         pass
 
-    # ---- TABLES
     try:
         with pdfplumber.open(pdf_path) as pdf:
             for i, page in enumerate(pdf.pages):
-                tables = page.extract_tables() or []
-                for table in tables:
-                    rows = []
-                    for row in table:
-                        clean = [c.strip() if c else "" for c in row]
-                        rows.append(" | ".join(clean))
+                for table in page.extract_tables() or []:
+                    rows = [
+                        " | ".join(c.strip() if c else "" for c in row)
+                        for row in table
+                    ]
                     table_text = "\n".join(rows)
                     if table_text.strip():
                         docs.append(
@@ -220,11 +253,7 @@ with st.sidebar:
         f for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")
     )
     if pdfs:
-        st.selectbox(
-            "Available PDFs (context)",
-            options=pdfs,
-            index=0,
-        )
+        st.selectbox("Available PDFs (context)", pdfs)
         st.caption(f"{len(pdfs)} PDFs indexed")
     else:
         st.warning("No PDFs found")
@@ -252,7 +281,8 @@ if "memory" not in st.session_state:
         token_limit=3000
     )
 
-with st.spinner("Loading knowledge base…"):
+with st.spinner("Preparing knowledge base…"):
+    ensure_pdfs_present()          # <-- CRITICAL ADDITION
     index = build_or_load_index()
 
 with st.expander("🔍 Index diagnostics"):
@@ -290,10 +320,7 @@ if user_q:
                 shown = set()
                 for r in sources:
                     md = r.node.metadata
-                    src = (
-                        md.get("source_file"),
-                        md.get("page"),
-                    )
+                    src = (md.get("source_file"), md.get("page"))
                     if src not in shown:
                         shown.add(src)
                         st.write(f"- {src[0]}, page {src[1]}")
