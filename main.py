@@ -1,12 +1,12 @@
 # app.py
 # Streamlit RAG (TEXT + TABLES, NO OCR)
-# Stable, conversational, context-guarded
-# Streamlit Community Cloud compatible
+# Cloud-safe startup with delayed indexing
+# Prevents Streamlit health-check failures
 
 import os
 import streamlit as st
 import nest_asyncio
-import requests   # <-- ADDED
+import requests
 
 # -------------------------------------------------
 # STREAMLIT PAGE CONFIG (MUST BE FIRST)
@@ -39,7 +39,6 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 # CONFIG (LOCAL + STREAMLIT CLOUD SAFE)
 # -------------------------------------------------
 OPENAI_API_KEY = None
-
 try:
     OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 except Exception:
@@ -53,7 +52,7 @@ if not OPENAI_API_KEY:
         "❌ OpenAI API key not found.\n\n"
         "Streamlit Cloud:\n"
         "  App → Settings → Secrets → OPENAI_API_KEY\n\n"
-        "Local run:\n"
+        "Local:\n"
         "  set OPENAI_API_KEY=sk-..."
     )
     st.stop()
@@ -65,7 +64,7 @@ os.makedirs(PDF_FOLDER, exist_ok=True)
 os.makedirs(PERSIST_DIR, exist_ok=True)
 
 # -------------------------------------------------
-# GOOGLE DRIVE PDF SOURCES (ADDED)
+# GOOGLE DRIVE PDF SOURCES
 # -------------------------------------------------
 PDF_FILES = {
     "Consolidated-HIV-and-AIDS-Guidelines-2022.pdf": "1rY_UE-sIw4f5Z5VUt0pyllPs7tSENsSr",
@@ -83,27 +82,21 @@ PDF_FILES = {
 }
 
 # -------------------------------------------------
-# DOWNLOAD PDFs FROM GOOGLE DRIVE (ADDED)
+# DOWNLOAD PDFs (CACHED, SAFE)
 # -------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def ensure_pdfs_present():
     for filename, file_id in PDF_FILES.items():
-        local_path = os.path.join(PDF_FOLDER, filename)
-
-        if os.path.exists(local_path):
-            continue  # already downloaded
+        path = os.path.join(PDF_FOLDER, filename)
+        if os.path.exists(path):
+            continue
 
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        r = requests.get(url, timeout=60)
+        r.raise_for_status()
 
-        try:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-
-            with open(local_path, "wb") as f:
-                f.write(r.content)
-
-        except Exception as e:
-            st.warning(f"Failed to download {filename}: {e}")
+        with open(path, "wb") as f:
+            f.write(r.content)
 
 # -------------------------------------------------
 # PROMPT
@@ -142,7 +135,7 @@ def load_models():
     )
 
 # -------------------------------------------------
-# PDF TEXT + TABLE EXTRACTION
+# PDF EXTRACTION
 # -------------------------------------------------
 def extract_text_and_tables(pdf_path: str) -> list[LIDocument]:
     docs = []
@@ -188,7 +181,7 @@ def extract_text_and_tables(pdf_path: str) -> list[LIDocument]:
     return docs
 
 # -------------------------------------------------
-# INDEX
+# INDEX (CACHED ONCE)
 # -------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def build_or_load_index():
@@ -205,13 +198,9 @@ def build_or_load_index():
                 extract_text_and_tables(os.path.join(PDF_FOLDER, fn))
             )
 
-    if not all_docs:
-        st.error("No usable text or tables found in PDFs.")
-        st.stop()
-
     parser = SimpleNodeParser.from_defaults(
-        chunk_size=1024,
-        chunk_overlap=150,
+        chunk_size=800,
+        chunk_overlap=120,
     )
     nodes = parser.get_nodes_from_documents(all_docs)
 
@@ -222,25 +211,19 @@ def build_or_load_index():
     return index
 
 # -------------------------------------------------
-# ANSWERING (GUARDED)
+# ANSWERING
 # -------------------------------------------------
-def guarded_answer(index, query, memory, top_k=10, threshold=0.30):
-    retriever = index.as_retriever(similarity_top_k=top_k)
+def guarded_answer(index, query, memory):
+    retriever = index.as_retriever(similarity_top_k=5)
     retrieved = retriever.retrieve(query)
 
     if not retrieved:
         return "I do not know.", []
 
-    best_score = max(r.score or 0 for r in retrieved)
-    if best_score < threshold:
-        return "I do not know.", retrieved
-
     qe = index.as_query_engine(
-        similarity_top_k=top_k,
         text_qa_template=STRICT_QA_PROMPT,
         memory=memory,
     )
-
     return str(qe.query(query)), retrieved
 
 # -------------------------------------------------
@@ -248,17 +231,7 @@ def guarded_answer(index, query, memory, top_k=10, threshold=0.30):
 # -------------------------------------------------
 with st.sidebar:
     st.header("📚 Knowledge Base")
-
-    pdfs = sorted(
-        f for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")
-    )
-    if pdfs:
-        st.selectbox("Available PDFs (context)", pdfs)
-        st.caption(f"{len(pdfs)} PDFs indexed")
-    else:
-        st.warning("No PDFs found")
-
-    st.divider()
+    st.caption("Guidelines loaded from Google Drive")
 
     if st.button("🧹 Clear chat history", use_container_width=True):
         st.session_state.messages = []
@@ -281,13 +254,22 @@ if "memory" not in st.session_state:
         token_limit=3000
     )
 
-with st.spinner("Preparing knowledge base…"):
-    ensure_pdfs_present()          # <-- CRITICAL ADDITION
-    index = build_or_load_index()
+# -------------------------------------------------
+# DELAY HEAVY WORK (CRITICAL FIX)
+# -------------------------------------------------
+if "index" not in st.session_state:
+    with st.spinner("Preparing knowledge base (first run only)…"):
+        st.write("Downloading guideline PDFs…")
+        ensure_pdfs_present()
 
-with st.expander("🔍 Index diagnostics"):
-    st.write("Indexed chunks:", len(index.docstore.docs))
+        st.write("Building search index…")
+        st.session_state.index = build_or_load_index()
 
+index = st.session_state.index
+
+# -------------------------------------------------
+# CHAT UI
+# -------------------------------------------------
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -299,15 +281,10 @@ if user_q:
         {"role": "user", "content": user_q}
     )
 
-    with st.chat_message("user"):
-        st.markdown(user_q)
-
     with st.chat_message("assistant"):
         with st.spinner("Thinking…"):
             answer, sources = guarded_answer(
-                index=index,
-                query=user_q,
-                memory=st.session_state.memory,
+                index, user_q, st.session_state.memory
             )
 
         st.markdown(answer)
