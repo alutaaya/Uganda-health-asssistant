@@ -1,6 +1,6 @@
 # app.py
 # Uganda Health Care Assistant
-# Streamlit Community Cloud SAFE version
+# Streamlit Community Cloud – STABLE VERSION
 
 import os
 import streamlit as st
@@ -19,7 +19,7 @@ st.set_page_config(
 nest_asyncio.apply()
 
 # -------------------------------------------------
-# BASIC CONFIG (LIGHTWEIGHT)
+# BASIC PATH CONFIG
 # -------------------------------------------------
 PDF_FOLDER = "pdfs"
 PERSIST_DIR = "storage"
@@ -42,7 +42,7 @@ if not OPENAI_API_KEY:
 if not OPENAI_API_KEY:
     st.error(
         "❌ OpenAI API key not found.\n\n"
-        "Streamlit Cloud → App → Settings → Secrets"
+        "Streamlit Cloud → App → Settings → Secrets → OPENAI_API_KEY"
     )
     st.stop()
 
@@ -63,12 +63,12 @@ st.title("🩺 Uganda Health Care Assistant")
 st.caption("Initializing knowledge base…")
 
 # -------------------------------------------------
-# DOWNLOAD PDFs (SAFE, CACHED)
+# STEP 1: DOWNLOAD PDFs (NO CACHING, NO RACE)
 # -------------------------------------------------
-@st.cache_resource(show_spinner=False)
 def ensure_pdfs_present():
     for fname, fid in PDF_FILES.items():
         path = os.path.join(PDF_FOLDER, fname)
+
         if os.path.exists(path):
             continue
 
@@ -80,11 +80,11 @@ def ensure_pdfs_present():
             f.write(r.content)
 
 # -------------------------------------------------
-# BUILD / LOAD INDEX (HEAVY IMPORTS INSIDE)
+# STEP 2: BUILD / LOAD INDEX (CACHED, READ-ONLY)
 # -------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_index():
-    # 🔽 Heavy imports ONLY here
+    # Heavy imports ONLY inside cached function
     from pypdf import PdfReader
     import pdfplumber
 
@@ -99,7 +99,7 @@ def load_index():
     from llama_index.llms.openai import OpenAI
     from llama_index.embeddings.openai import OpenAIEmbedding
 
-    # Models
+    # Configure models
     Settings.llm = OpenAI(
         api_key=OPENAI_API_KEY,
         model="gpt-4o-mini",
@@ -109,19 +109,21 @@ def load_index():
         model="text-embedding-3-small",
     )
 
-    # Load persisted index if exists
+    # Load existing index if present
     if os.path.exists(os.path.join(PERSIST_DIR, "docstore.json")):
         storage = StorageContext.from_defaults(persist_dir=PERSIST_DIR)
         return load_index_from_storage(storage)
 
-    # Build index
+    # Build new index
     docs = []
+
     for fn in os.listdir(PDF_FOLDER):
         if not fn.lower().endswith(".pdf"):
             continue
 
         path = os.path.join(PDF_FOLDER, fn)
 
+        # ---- TEXT
         reader = PdfReader(path)
         for i, page in enumerate(reader.pages):
             text = page.extract_text() or ""
@@ -133,7 +135,7 @@ def load_index():
                     )
                 )
 
-        # Optional: tables (safe version)
+        # ---- TABLES (safe version)
         with pdfplumber.open(path) as pdf:
             for i, page in enumerate(pdf.pages):
                 for table in page.extract_tables() or []:
@@ -163,11 +165,15 @@ def load_index():
     return index
 
 # -------------------------------------------------
-# INITIALIZE ONCE (AFTER HEALTH CHECK)
+# CONTROLLED INITIALIZATION (NO RACE CONDITIONS)
 # -------------------------------------------------
-if "index" not in st.session_state:
-    with st.spinner("Preparing knowledge base (first run only)…"):
+if "pdfs_ready" not in st.session_state:
+    with st.spinner("Downloading guideline PDFs…"):
         ensure_pdfs_present()
+        st.session_state.pdfs_ready = True
+
+if "index" not in st.session_state:
+    with st.spinner("Building search index…"):
         st.session_state.index = load_index()
 
 index = st.session_state.index
@@ -175,7 +181,7 @@ index = st.session_state.index
 st.success("Knowledge base ready ✅")
 
 # -------------------------------------------------
-# CHAT
+# CHAT UI
 # -------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -187,7 +193,9 @@ for m in st.session_state.messages:
 user_q = st.chat_input("Ask a clinical or programmatic question")
 
 if user_q:
-    st.session_state.messages.append({"role": "user", "content": user_q})
+    st.session_state.messages.append(
+        {"role": "user", "content": user_q}
+    )
 
     with st.chat_message("assistant"):
         qe = index.as_query_engine()
